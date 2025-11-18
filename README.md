@@ -4,8 +4,9 @@ To adhere to the EULA of Aseprite, this workflow does not upload the binary in a
 
 The release can be found within the releases as a draft (only visible for repo owner).
 
-# References to other Aseprite builders
+## References to other Aseprite builders
 - https://github.com/ellisonoswalt/aseprite_builder
 
-# Support Aseprite
+## Support Aseprite
+
 Keep supporting Aseprite at https://aseprite.org/#buy
