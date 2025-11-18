@@ -1,0 +1,218 @@
+name: Aseprite Auto Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version_found: ${{ steps.compare_versions.outputs.new_version_found }}
+      new_version_tag: ${{ steps.compare_versions.outputs.new_version_tag }}
+      is_prerelease: ${{ steps.compare_versions.outputs.is_prerelease }}
+    steps:
+      - name: Cache Last Built Version
+        id: cache-version
+        uses: actions/cache@v4
+        with:
+          path: last_built_version.txt
+          key: aseprite-last-built-version
+
+      - name: Get Latest Aseprite Release Tag
+        id: get_tag
+        run: |
+          LATEST_JSON=$(curl -sL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/aseprite/aseprite/releases/latest)
+          
+          LATEST_TAG=$(echo $LATEST_JSON | jq -r .tag_name)
+          IS_PRERELEASE=$(echo $LATEST_JSON | jq -r .prerelease)
+
+          echo "new_version_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+
+      - name: Compare Versions
+        id: compare_versions
+        run: |
+          LAST_BUILT_VERSION=$(cat last_built_version.txt 2>/dev/null || echo "v0.0.0")
+          LATEST_TAG="${{ steps.get_tag.outputs.new_version_tag }}"
+
+          if [[ "$LAST_BUILT_VERSION" == "$LATEST_TAG" ]]; then
+            echo "new_version_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "new_version_found=true" >> $GITHUB_OUTPUT
+            echo "new_version_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "is_prerelease=${{ steps.get_tag.outputs.is_prerelease }}" >> $GITHUB_OUTPUT
+          fi
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: check-version
+    if: needs.check-version.outputs.new_version_found == 'true'
+    outputs:
+      upload_url: ${{ steps.create_release_step.outputs.upload_url }}
+      release_id: ${{ steps.create_release_step.outputs.id }}
+    steps:
+      - name: Create Draft Release
+        id: create_release_step
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.check-version.outputs.new_version_tag }}
+          release_name: Aseprite ${{ needs.check-version.outputs.new_version_tag }} (Automated Build)
+          body: |
+            This is an automated build of Aseprite version ${{ needs.check-version.outputs.new_version_tag }}.
+            Source: https://github.com/aseprite/aseprite/releases/tag/${{ needs.check-version.outputs.new_version_tag }}
+          draft: true
+          prerelease: ${{ needs.check-version.outputs.is_prerelease }}
+
+  build-and-upload:
+    runs-on: ${{ matrix.os }}
+    needs: [check-version, create-release]
+    if: needs.check-version.outputs.new_version_found == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            asset_name_suffix: Windows-x64
+            skia_arch: x64
+          # - os: macos-latest
+          #   asset_name_suffix: macOS-arm64
+          #   skia_arch: arm64
+          - os: ubuntu-latest
+            asset_name_suffix: Linux-x64
+            skia_arch: x64
+
+    steps:
+      - name: Checkout Aseprite repository
+        uses: actions/checkout@v4
+        with:
+          repository: aseprite/aseprite
+          ref: ${{ needs.check-version.outputs.new_version_tag }}
+          submodules: 'recursive'
+
+      - name: Install Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libfontconfig1-dev zip
+
+      - name: Get Skia from Cache or Download
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: skia
+          key: ${{ runner.os }}-skia-${{ matrix.skia_arch }}-${{ hashFiles('laf/misc/skia-url.sh') }}
+
+      - name: Download and Unzip Skia
+        if: steps.cache-skia.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            this_dir=$(cygpath "${{ github.workspace }}")
+          else
+            this_dir="${{ github.workspace }}"
+          fi
+          skia_url=$(source $this_dir/laf/misc/skia-url.sh --arch=${{ matrix.skia_arch }} | xargs)
+          skia_file=$(basename $skia_url)
+          curl --retry 5 --retry-delay 5 -L -o "$skia_file" "$skia_url"
+          unzip -q "$skia_file" -d skia
+          rm "$skia_file"
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.17
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        with:
+          key: ${{ matrix.os }}-${{ matrix.asset_name_suffix }}-${{ needs.check-version.outputs.new_version_tag }}
+
+      - name: Install Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Setup MSVC Environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Generating Makefiles (CMake)
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            export enable_ccache=off
+          else
+            export enable_ccache=on
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14 \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=$enable_ccache \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-${{ matrix.skia_arch }})
+            
+      - name: Compile Aseprite
+        shell: bash
+        run: |
+          cd build && ninja
+
+      - name: Package build artifacts
+        shell: bash
+        run: |
+          ARTIFACT_DIR="Aseprite"
+          mkdir -p "$ARTIFACT_DIR/data"
+          cp -r build/bin/data/* "$ARTIFACT_DIR/data/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build/bin/aseprite.exe "$ARTIFACT_DIR/"
+          else
+            cp build/bin/aseprite "$ARTIFACT_DIR/"
+          fi
+          
+          ASSET_NAME="Aseprite-${{ needs.check-version.outputs.new_version_tag }}-${{ matrix.asset_name_suffix }}.zip"
+          zip -r "../$ASSET_NAME" "$ARTIFACT_DIR"
+          echo "ASSET_PATH=../$ASSET_NAME" >> $GITHUB_ENV
+          echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
+          
+      - name: Upload to Draft Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ${{ env.ASSET_PATH }}
+          asset_name: ${{ env.ASSET_NAME }}
+          asset_content_type: application/zip
+
+  update-version-cache:
+    runs-on: ubuntu-latest
+    needs: [check-version, build-and-upload]
+    if: success() && needs.check-version.outputs.new_version_found == 'true'
+    steps:
+      - name: Cache Last Built Version (for saving)
+        id: cache-version-restore
+        uses: actions/cache@v4
+        with:
+          path: last_built_version.txt
+          key: aseprite-last-built-version
+
+      - name: Update Last Built Version File
+        run: |
+          echo "${{ needs.check-version.outputs.new_version_tag }}" > last_built_version.txt
+      
+      - name: Save New Version to Cache
+        uses: actions/cache/save@v4
+        with:
+          path: last_built_version.txt
+          key: aseprite-last-built-version
