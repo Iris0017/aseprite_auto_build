@@ -174,16 +174,19 @@ jobs:
           ARTIFACT_DIR="Aseprite"
           mkdir -p "$ARTIFACT_DIR/data"
           cp -r build/bin/data/* "$ARTIFACT_DIR/data/"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp build/bin/aseprite.exe "$ARTIFACT_DIR/"
-          else
-            cp build/bin/aseprite "$ARTIFACT_DIR/"
-          fi
           
           ASSET_NAME="Aseprite-${{ needs.check-version.outputs.new_version_tag }}-${{ matrix.asset_name_suffix }}.zip"
-          zip -r "../$ASSET_NAME" "$ARTIFACT_DIR"
-          echo "ASSET_PATH=../$ASSET_NAME" >> $GITHUB_ENV
           echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build/bin/aseprite.exe "$ARTIFACT_DIR/"
+            ASSET_PATH="../$ASSET_NAME"
+            powershell.exe -Command "Compress-Archive -Path '$ARTIFACT_DIR' -DestinationPath '$ASSET_PATH'"
+          else
+            cp build/bin/aseprite "$ARTIFACT_DIR/"
+            zip -r "../$ASSET_NAME" "$ARTIFACT_DIR"
+          fi
+          
+          echo "ASSET_PATH=../$ASSET_NAME" >> $GITHUB_ENV
           
       - name: Upload to Draft Release
         uses: actions/upload-release-asset@v1
